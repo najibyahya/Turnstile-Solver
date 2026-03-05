@@ -1,0 +1,15 @@
+# Format proxy yang didukung (satu proxy per baris):
+#
+# Tanpa autentikasi:
+#   protocol://host:port
+#
+# Dengan autentikasi:
+#   protocol://user:pass@host:port
+#
+# Protocol yang didukung: http, https, socks5
+#
+# Contoh:
+# http://203.0.113.10:3128
+# socks5://203.0.113.20:1080
+# http://username:password@203.0.113.30:8080
+# socks5://username:password@203.0.113.40:1080
