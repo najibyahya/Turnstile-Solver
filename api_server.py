@@ -355,6 +355,27 @@ def create_app(headless: bool, thread: int, page_count: int, proxy_support: bool
 
 
 # ──────────────────────────────────────────────
+#  BANNER
+# ──────────────────────────────────────────────
+def _print_banner():
+    banner = r"""
+  ____        _                _
+ | __ )  ___ | |_ ___ _ __ __| |_ __ ___  _ __
+ |  _ \ / _ \| __/ _ \ '__/ _` | '__/ _ \| '_ \
+ | |_) | (_) | ||  __/ | | (_| | | | (_) | |_) |
+ |____/ \___/ \__\___|_|  \__,_|_|  \___/| .__/
+  ____        _                           |_|
+ / ___|  ___ | |_   _____ _ __
+ \___ \ / _ \| \ \ / / _ \ '__|
+  ___) | (_) | |\ V /  __/ |   Turnstile v1.0.0
+ |____/ \___/|_| \_/ \___|_|
+"""
+    print("\033[96m" + banner + "\033[0m")
+    print("  \033[90m github.com/najibyahya/Turnstile-Solver\033[0m")
+    print()
+
+
+# ──────────────────────────────────────────────
 #  AUTO INSTALL DEPENDENSI
 # ──────────────────────────────────────────────
 def _auto_install():
@@ -609,6 +630,7 @@ def _check_port(cfg: dict) -> dict:
 #  ENTRY POINT
 # ──────────────────────────────────────────────
 if __name__ == '__main__':
+    _print_banner()
     _auto_install()
     config = _load_config()
     config = _interactive_config(config)
