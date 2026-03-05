@@ -374,7 +374,6 @@ def _print_banner():
     print("  \033[90m github.com/najibyahya/Turnstile-Solver\033[0m")
     print()
 
-
 # ──────────────────────────────────────────────
 #  AUTO INSTALL DEPENDENSI
 # ──────────────────────────────────────────────
@@ -415,6 +414,49 @@ def _auto_install():
         subprocess.check_call([sys.executable, "-m", "camoufox", "fetch"])
         print("  ✅  Data browser Camoufox berhasil diunduh")
     print("═" * 52 + "\n")
+
+
+def _check_xvfb(headless: bool):
+    """Jika headless=False di Linux tanpa display, wajibkan xvfb-run."""
+    if sys.platform == "win32" or headless:
+        return  # Tidak diperlukan di Windows atau mode headless
+
+    import shutil, subprocess
+    display = os.environ.get("DISPLAY", "")
+    if display:
+        print("  ✅  DISPLAY terdeteksi, mode GUI dapat berjalan normal")
+        return
+
+    print("═" * 52)
+    print("  🖥️   CEK XVFB (diperlukan untuk headless=false di VPS)")
+    print("═" * 52)
+    print("  ⚠️   headless=false terdeteksi tapi tidak ada DISPLAY.")
+    print("  📌  Kamu berada di VPS/server tanpa GUI.")
+
+    # Coba install xvfb jika belum ada
+    if not shutil.which("xvfb-run"):
+        print("  📦  Menginstall Xvfb...")
+        try:
+            subprocess.check_call(
+                ["apt-get", "install", "-y", "xvfb"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print("  ✅  Xvfb berhasil diinstall")
+        except Exception:
+            print("  ❌  Gagal install Xvfb otomatis. Jalankan manual:")
+            print("      sudo apt-get install -y xvfb")
+    else:
+        print("  ✅  Xvfb sudah terpasang")
+
+    print()
+    print("  🚨  WAJIB jalankan script dengan:")
+    print()
+    print("       xvfb-run -a python3 api_server.py")
+    print()
+    print("  ℹ️   Atau ubah headless=true di config.json untuk mode tanpa GUI.")
+    print("═" * 52 + "\n")
+    sys.exit(1)
 
 
 def _camoufox_data_exists():
@@ -634,6 +676,7 @@ if __name__ == '__main__':
     _auto_install()
     config = _load_config()
     config = _interactive_config(config)
+    _check_xvfb(config.get("headless", True))
 
     print()
     print("═" * 52)
