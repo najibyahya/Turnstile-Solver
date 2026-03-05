@@ -155,6 +155,64 @@ GET /result?id=<task_id>
 
 ---
 
+## 💻 Contoh Penggunaan
+
+### Python
+```python
+import requests
+import time
+
+BASE_URL = "http://localhost:8000"
+
+def solve_turnstile(url: str, sitekey: str) -> str:
+    # Kirim tugas
+    res = requests.get(f"{BASE_URL}/turnstile", params={"url": url, "sitekey": sitekey})
+    task_id = res.json()["task_id"]
+
+    # Poll hasil
+    while True:
+        result = requests.get(f"{BASE_URL}/result", params={"id": task_id}).json()
+        if result["status"] == "success":
+            return result["value"]
+        elif result["status"] == "error":
+            raise Exception(f"Gagal: {result.get('value')}")
+        time.sleep(1)
+
+token = solve_turnstile("https://example.com", "0x4AAAAAAA...")
+print("Token:", token)
+```
+
+### Node.js
+```javascript
+const axios = require("axios");
+
+const BASE_URL = "http://localhost:8000";
+
+async function solveTurnstile(url, sitekey) {
+  // Kirim tugas
+  const { data } = await axios.get(`${BASE_URL}/turnstile`, {
+    params: { url, sitekey },
+  });
+  const taskId = data.task_id;
+
+  // Poll hasil
+  while (true) {
+    const { data: result } = await axios.get(`${BASE_URL}/result`, {
+      params: { id: taskId },
+    });
+    if (result.status === "success") return result.value;
+    if (result.status === "error") throw new Error(`Gagal: ${result.value}`);
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+solveTurnstile("https://example.com", "0x4AAAAAAA...")
+  .then((token) => console.log("Token:", token))
+  .catch(console.error);
+```
+
+---
+
 ## ❗ Referensi Error
 
 ### Error saat startup
