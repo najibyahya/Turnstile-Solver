@@ -48,6 +48,23 @@ python api_server.py
 
 > Script akan otomatis menginstall semua dependensi yang dibutuhkan (`fastapi`, `uvicorn`, `camoufox`, `loguru`, `psutil`) dan mengunduh browser Camoufox jika belum ada.
 
+### 🖥️ Catatan untuk VPS / Server Linux (headless=false)
+
+Jika kamu menggunakan `"headless": false` di VPS tanpa GUI, browser **tidak bisa membuka tampilan** secara langsung. Kamu perlu **Xvfb** (virtual display).
+
+**Install Xvfb:**
+```bash
+sudo apt-get install -y xvfb
+```
+
+**Jalankan script dengan Xvfb:**
+```bash
+xvfb-run -a python3 api_server.py
+```
+
+> Script akan otomatis mendeteksi kondisi ini dan mengingatkan kamu jika lupa menggunakan `xvfb-run`.
+> Alternatif paling mudah: set `"headless": true` di `config.json`.
+
 ---
 
 ## ⚙️ Konfigurasi (`config.json`)
