@@ -11,18 +11,25 @@ from camoufox import DefaultAddons
 from camoufox.async_api import AsyncCamoufox
 import uvicorn
 
-# Kompatibilitas Windows: gunakan SelectorEventLoop agar asyncio.Queue & task berjalan normal
+# Kompatibilitas Windows
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-class TurnstileAPIServer:
+
+class ClearanceAPIServer:
+    """
+    Solver gabungan:
+      GET /turnstile  → Cloudflare Turnstile token
+      GET /clearance  → cf_clearance cookie (bypass Cloudflare WAF)
+    """
+
     HTML_TEMPLATE = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>body's solver</title>
+        <title>Boterdrop Solver</title>
         <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async="" defer=""></script>
     </head>
     <body>
@@ -32,7 +39,8 @@ class TurnstileAPIServer:
     </html>
     """
 
-    def __init__(self, headless: bool, thread: int, page_count: int, proxy_support: bool, proxy_file: str = "proxies.txt"):
+    def __init__(self, headless: bool, thread: int, page_count: int,
+                 proxy_support: bool, proxy_file: str = "proxies.txt"):
         self.app = FastAPI()
         self.headless = headless
         self.thread_count = thread
@@ -40,131 +48,79 @@ class TurnstileAPIServer:
         self.proxy_support = proxy_support
         self.proxy_file = proxy_file
         self.page_pool = asyncio.Queue()
-        # Konfigurasi argumen startup browser
         self.browser_args = [
-            "--no-sandbox",  # Nonaktifkan sandbox, diperlukan di beberapa lingkungan
-            "--disable-setuid-sandbox",  # Digunakan bersama no-sandbox
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
         ]
-        self.camoufox = None  # Instance Camoufox
-        self.results = {}  # Penyimpanan hasil tugas
-        self.proxies = []  # Daftar proxy (diisi saat startup jika proxy_support=True)
-        self._proxy_index = 0  # Indeks rotasi proxy
+        self.camoufox = None
+        self.browser = None
+        self.results = {}
+        self.proxies = []
+        self._proxy_index = 0
         self.max_task_num = self.thread_count * self.page_count
-        # Daftarkan event startup dan shutdown
+
         self.app.add_event_handler("startup", self._startup)
         self.app.add_event_handler("shutdown", self._shutdown)
         self.app.get("/turnstile")(self.process_turnstile)
+        self.app.get("/clearance")(self.process_clearance)
         self.app.get("/result")(self.get_result)
 
-    async def _cleanup_results(self):
-        """Bersihkan hasil yang kedaluwarsa secara berkala"""
-        while True:
-            await asyncio.sleep(3600)  # Bersihkan setiap jam
-            expired = [
-                tid for tid, res in self.results.items()
-                if isinstance(res, dict) and res.get("status") == "error"
-                   and time.time() - res.get("start_time", 0) > 3600
-            ]
-            for tid in expired:
-                self.results.pop(tid, None)
-                logger.debug(f"Membersihkan tugas kedaluwarsa: {tid}")
-
-    async def _periodic_cleanup(self, interval_minutes: int = 60):
-        """Bersihkan dan bangun ulang halaman satu per satu secara berkala untuk menghindari pemblokiran tugas"""
-        while True:
-            await asyncio.sleep(interval_minutes * 60)
-            logger.info("Mulai membersihkan cache halaman dan konteks satu per satu")
-
-            total = self.max_task_num
-            success = 0
-            for _ in range(total):
-                try:
-                    # Coba ambil halaman dari pool (menandakan halaman sedang idle)
-                    page, context= await self.page_pool.get()
-                    try:
-                        await page.close()
-                    except:
-                        pass
-                    try:
-                        await context.close()
-                    except Exception as e:
-                        logger.warning(f"Error saat membersihkan halaman: {e}")
-
-                    context = await self._create_context_with_proxy()
-                    page = await context.new_page()
-                    await self.page_pool.put((page, context))
-                    success += 1
-                    await asyncio.sleep(1.5)  # Tunggu sebentar untuk menghindari dampak berantai
-                except Exception as e:
-                    logger.warning(f"Gagal membersihkan dan membangun ulang halaman: {e}")
-                    continue
-            logger.success(f"Pembersihan berkala selesai, total diproses {success}/{total} halaman")
-
-    async def _startup(self) -> None:
-        """Initialize the browser and page pool on startup."""
-        logger.info("Mulai inisialisasi browser")
-        try:
-            await self._initialize_browser()
-        except Exception as e:
-            logger.error(f"Inisialisasi browser gagal: {str(e)}")
-            raise
-
-    async def _shutdown(self) -> None:
-        """Bersihkan semua sumber daya browser saat shutdown"""
-        logger.info("Mulai membersihkan sumber daya browser")
-        try:
-            await self.browser.close()
-        except Exception as e:
-            logger.warning(f"Terjadi kesalahan saat menutup browser: {e}")
-        logger.success("Semua sumber daya browser telah dibersihkan")
-
-    async def _create_context_with_proxy(self, proxy: str = None):
-        """Buat konteks browser berdasarkan proxy.
-        Format: protocol://host:port  atau  protocol://user:pass@host:port
-        """
-        if not proxy:
-            return await self.browser.new_context()
-
-        from urllib.parse import urlparse
-        parsed = urlparse(proxy)
-
-        if not parsed.scheme or not parsed.hostname:
-            logger.warning(f"Format proxy tidak valid: {proxy}, menggunakan konteks tanpa proxy")
-            return await self.browser.new_context()
-
-        server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-
-        if parsed.username and parsed.password:
-            return await self.browser.new_context(
-                proxy={
-                    "server": server,
-                    "username": parsed.username,
-                    "password": parsed.password,
-                }
-            )
-        return await self.browser.new_context(proxy={"server": server})
+    # ──────────────────────────────────────────────
+    #  PROXY
+    # ──────────────────────────────────────────────
 
     def _load_proxies(self):
-        """Muat daftar proxy dari file.
-        Format: protocol://host:port  atau  protocol://user:pass@host:port
-        """
         if not self.proxy_support:
             return
         if not os.path.isfile(self.proxy_file):
-            logger.warning(f"proxy_support aktif tapi file '{self.proxy_file}' tidak ditemukan. Berjalan tanpa proxy.")
+            logger.warning(f"proxy_support aktif tapi file '{self.proxy_file}' tidak ditemukan.")
             return
-        with open(self.proxy_file, "r") as f:
+        with open(self.proxy_file) as f:
             lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
         self.proxies = lines
         logger.info(f"Memuat {len(self.proxies)} proxy dari '{self.proxy_file}'")
 
     def _next_proxy(self):
-        """Kembalikan proxy berikutnya secara round-robin, atau None jika kosong."""
         if not self.proxies:
             return None
         proxy = self.proxies[self._proxy_index % len(self.proxies)]
         self._proxy_index += 1
         return proxy
+
+    async def _create_context_with_proxy(self, proxy: str = None):
+        if not proxy:
+            return await self.browser.new_context()
+        from urllib.parse import urlparse
+        parsed = urlparse(proxy)
+        if not parsed.scheme or not parsed.hostname:
+            logger.warning(f"Format proxy tidak valid: {proxy}")
+            return await self.browser.new_context()
+        server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        if parsed.username and parsed.password:
+            return await self.browser.new_context(
+                proxy={"server": server, "username": parsed.username, "password": parsed.password}
+            )
+        return await self.browser.new_context(proxy={"server": server})
+
+    # ──────────────────────────────────────────────
+    #  BROWSER LIFECYCLE
+    # ──────────────────────────────────────────────
+
+    async def _startup(self):
+        logger.info("Inisialisasi browser...")
+        try:
+            await self._initialize_browser()
+        except Exception as e:
+            logger.error(f"Inisialisasi gagal: {e}")
+            raise
+
+    async def _shutdown(self):
+        logger.info("Menutup browser...")
+        try:
+            await self.browser.close()
+        except Exception as e:
+            logger.warning(f"Error saat menutup browser: {e}")
+        logger.success("Browser berhasil ditutup")
 
     async def _initialize_browser(self):
         self._load_proxies()
@@ -174,156 +130,242 @@ class TurnstileAPIServer:
             args=self.browser_args
         )
         self.browser = await self.camoufox.start()
-
-        # Buat pool halaman — setiap thread mendapat proxy berbeda (round-robin)
         for _ in range(self.thread_count):
             proxy = self._next_proxy() if self.proxy_support else None
             context = await self._create_context_with_proxy(proxy)
             for _ in range(self.page_count):
                 page = await context.new_page()
                 await self.page_pool.put((page, context))
+        logger.success(f"Pool siap: {self.page_pool.qsize()} halaman")
+        asyncio.create_task(self._cleanup_results())
+        asyncio.create_task(self._periodic_cleanup())
 
-        logger.success(f"Pool halaman berhasil diinisialisasi, berisi {self.page_pool.qsize()} halaman")
-        asyncio.create_task(self._cleanup_results())  # Bersihkan hasil tugas
-        asyncio.create_task(self._periodic_cleanup())  # Bersihkan cache halaman dan konteks secara berkala
+    async def _cleanup_results(self):
+        """Bersihkan semua hasil (success & error) yang sudah lebih dari 10 menit dan belum diambil."""
+        while True:
+            await asyncio.sleep(300)  # Cek setiap 5 menit
+            now = time.time()
+            expired = [
+                tid for tid, res in list(self.results.items())
+                if isinstance(res, dict)
+                and now - res.get("start_time", now) > 300  # Hapus jika > 5 menit
+            ]
+            if expired:
+                for tid in expired:
+                    self.results.pop(tid, None)
+                logger.info(f"[Cleanup] Menghapus {len(expired)} hasil kedaluwarsa dari memori")
 
-    async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: str = None, cdata: str = None):
-        """Selesaikan captcha Turnstile menggunakan halaman dari pool"""
+    async def _periodic_cleanup(self, interval_minutes: int = 10):
+        """Bersihkan cookie & reset halaman secara berkala tanpa menutup context (aman dari race condition)."""
+        while True:
+            await asyncio.sleep(interval_minutes * 60)
+            logger.info("[Cleanup] Memulai pembersihan cookie & reset halaman...")
+            total = self.max_task_num
+            success = 0
+            for _ in range(total):
+                try:
+                    page, context = await self.page_pool.get()
+                    try:
+                        await page.unroute_all()
+                    except Exception:
+                        pass
+                    try:
+                        await context.clear_cookies()
+                    except Exception:
+                        pass
+                    try:
+                        await page.goto("about:blank")
+                    except Exception:
+                        pass
+                    await self.page_pool.put((page, context))
+                    success += 1
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"[Cleanup] Gagal reset halaman: {e}")
+            logger.success(f"[Cleanup] Selesai, {success}/{total} halaman berhasil dibersihkan")
+
+    # ──────────────────────────────────────────────
+    #  TURNSTILE SOLVER
+    # ──────────────────────────────────────────────
+
+    async def _solve_turnstile(self, task_id: str, url: str, sitekey: str,
+                                action: str = None, cdata: str = None):
         start_time = time.time()
         page, context = await self.page_pool.get()
         try:
-            url_with_slash = url + "/" if not url.endswith("/") else url
-            turnstile_div = (f'<div class="cf-turnstile" style="background: white;" data-sitekey="{sitekey}"' +
-                             (f' data-action="{action}"' if action else '') +
-                             (f' data-cdata="{cdata}"' if cdata else '') + '></div>')
+            url_with_slash = url if url.endswith("/") else url + "/"
+            turnstile_div = (
+                f'<div class="cf-turnstile" style="background:white;" data-sitekey="{sitekey}"'
+                + (f' data-action="{action}"' if action else "")
+                + (f' data-cdata="{cdata}"' if cdata else "")
+                + "></div>"
+            )
             page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
             await page.route(url_with_slash, lambda route: route.fulfill(body=page_data, status=200))
             await page.goto(url_with_slash)
             await page.eval_on_selector("//div[@class='cf-turnstile']", "el => el.style.width = '70px'")
 
-            # Coba selesaikan captcha, maksimal 30 percobaan
             for attempt in range(30):
                 try:
-                    # Periksa nilai respons captcha
-                    turnstile_check = await page.input_value("[name=cf-turnstile-response]", timeout=400)
-                    if turnstile_check == "":
-                        # Jika respons kosong, klik elemen captcha untuk memicu verifikasi
+                    value = await page.input_value("[name=cf-turnstile-response]", timeout=400)
+                    if value == "":
                         await page.locator("//div[@class='cf-turnstile']").click(timeout=400)
                         await asyncio.sleep(0.2)
                     else:
-                        # Captcha berhasil diselesaikan
-                        elapsed_time = round(time.time() - start_time, 3)
-                        self.results[task_id] = {
-                            "status": 'success',
-                            "elapsed_time": elapsed_time,
-                            "value": turnstile_check
-                        }
-                        logger.info(f"Captcha berhasil diselesaikan, Task ID: {task_id}, waktu: {elapsed_time} detik")
-                        break
+                        elapsed = round(time.time() - start_time, 3)
+                        self.results[task_id] = {"status": "success", "elapsed_time": elapsed, "value": value}
+                        logger.info(f"[Turnstile] Sukses — {task_id} ({elapsed}s)")
+                        return
                 except Exception as e:
-                    # Percobaan tunggal gagal, lanjutkan ke percobaan berikutnya
-                    logger.debug(f"Percobaan captcha {attempt + 1} gagal: {e}")
+                    logger.debug(f"[Turnstile] Percobaan {attempt + 1} gagal: {e}")
 
-            # Jika semua percobaan gagal, tandai sebagai error
-            if self.results.get(task_id) == {"status": "process", "message": 'solving captcha'}:
-                elapsed_time = round(time.time() - start_time, 3)
-                self.results[task_id] = {
-                    "status": "error",
-                    "elapsed_time": elapsed_time,
-                    "value": "captcha_fail"
-                }
-                logger.warning(f"Captcha gagal diselesaikan, Task ID: {task_id}, waktu: {elapsed_time} detik")
-
+            elapsed = round(time.time() - start_time, 3)
+            self.results[task_id] = {"status": "error", "elapsed_time": elapsed, "value": "captcha_fail"}
+            logger.warning(f"[Turnstile] Gagal setelah 30 percobaan — {task_id}")
         except Exception as e:
-            # Tangani situasi pengecualian
-            elapsed_time = round(time.time() - start_time, 3)
-            self.results[task_id] = {
-                "status": "error",
-                "elapsed_time": elapsed_time,
-                "value": "captcha_fail"
-            }
-            logger.error(f"Pengecualian saat memecahkan captcha, Task ID: {task_id}: {e}")
+            elapsed = round(time.time() - start_time, 3)
+            self.results[task_id] = {"status": "error", "elapsed_time": elapsed, "value": "captcha_fail"}
+            logger.error(f"[Turnstile] Exception — {task_id}: {e}")
         finally:
-            # Kembalikan halaman ke pool
+            try:
+                await page.unroute_all()
+            except Exception:
+                pass
             await self.page_pool.put((page, context))
 
-    async def process_turnstile(self, url: str = Query(...), sitekey: str = Query(...), action: str = Query(None),
-                                cdata: str = Query(None)):
-        """Tangani permintaan endpoint /turnstile"""
-        # Validasi parameter
-        if not url or not sitekey:
-            raise HTTPException(
-                status_code=400,
-                detail={"status": "error", "error": "Parameter 'url' dan 'sitekey' harus disertakan"}
-            )
+    # ──────────────────────────────────────────────
+    #  CF_CLEARANCE SOLVER
+    # ──────────────────────────────────────────────
 
-        # Periksa beban server berdasarkan ketersediaan halaman di pool
-        available_pages = self.page_pool.qsize()
-        if available_pages == 0:
-            logger.warning(f"Beban server penuh, tidak ada halaman tersedia (kapasitas: {self.max_task_num})")
-            return JSONResponse(
-                content={"status": "error", "error": "Server telah mencapai kapasitas maksimum, coba lagi nanti"},
-                status_code=429
-            )
-
-        # Buat task ID unik
-        task_id = str(uuid.uuid4())
-        logger.info(f"Menerima tugas baru, task_id: {task_id}, url: {url}, sitekey: {sitekey}")
-
-        # Inisialisasi status tugas
-        self.results[task_id] = {
-            "status": "process",
-            "message": 'solving captcha',
-            "start_time": time.time()
-        }
-
+    async def _solve_clearance(self, task_id: str, url: str, timeout: int = 30):
+        """
+        Navigasikan browser ke URL target, tunggu Cloudflare challenge selesai,
+        lalu ambil cookie cf_clearance dan User-Agent.
+        """
+        start_time = time.time()
+        page, context = await self.page_pool.get()
         try:
-            # Buat tugas asinkron untuk memproses captcha
-            asyncio.create_task(
-                self._solve_turnstile(
-                    task_id=task_id,
-                    url=url,
-                    sitekey=sitekey,
-                    action=action,
-                    cdata=cdata
-                )
-            )
-            return JSONResponse(
-                content={"task_id": task_id, "status": "accepted"},
-                status_code=202
-            )
+            user_agent = await page.evaluate("navigator.userAgent")
+
+            logger.info(f"[Clearance] Navigasi ke {url} — {task_id}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+
+            # Tunggu Cloudflare challenge selesai
+            # Indikator: judul halaman bukan "Just a moment..." dan cf_clearance ada di cookies
+            deadline = time.time() + timeout
+            cf_clearance = None
+            while time.time() < deadline:
+                title = await page.title()
+                cookies = await context.cookies()
+                cf_cookie = next((c for c in cookies if c["name"] == "cf_clearance"), None)
+
+                if cf_cookie and "just a moment" not in title.lower():
+                    cf_clearance = cf_cookie["value"]
+                    break
+
+                # Jika ada tantangan interaktif, coba tunggu saja
+                await asyncio.sleep(1)
+
+            elapsed = round(time.time() - start_time, 3)
+
+            if cf_clearance:
+                # Kumpulkan semua cookies dari domain
+                all_cookies = await context.cookies()
+                cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in all_cookies)
+                self.results[task_id] = {
+                    "status": "success",
+                    "elapsed_time": elapsed,
+                    "cf_clearance": cf_clearance,
+                    "user_agent": user_agent,
+                    "cookies": cookie_header,
+                }
+                logger.success(f"[Clearance] Sukses — {task_id} ({elapsed}s)")
+            else:
+                title = await page.title()
+                self.results[task_id] = {
+                    "status": "error",
+                    "elapsed_time": elapsed,
+                    "value": "clearance_fail",
+                    "message": f"cf_clearance tidak ditemukan setelah {timeout}s. Judul halaman: '{title}'",
+                }
+                logger.warning(f"[Clearance] Gagal — {task_id}")
+
         except Exception as e:
-            logger.error(f"Terjadi kesalahan tak terduga saat memproses permintaan: {str(e)}")
-            # Bersihkan tugas yang gagal
+            elapsed = round(time.time() - start_time, 3)
+            self.results[task_id] = {"status": "error", "elapsed_time": elapsed, "value": str(e)}
+            logger.error(f"[Clearance] Exception — {task_id}: {e}")
+        finally:
+            # Reset halaman & bersihkan cookies agar tidak membawa state lama
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
+            try:
+                await page.goto("about:blank")
+            except Exception:
+                pass
+            await self.page_pool.put((page, context))
+
+    # ──────────────────────────────────────────────
+    #  ENDPOINTS
+    # ──────────────────────────────────────────────
+
+    async def process_turnstile(self, url: str = Query(...), sitekey: str = Query(...),
+                                 action: str = Query(None), cdata: str = Query(None)):
+        if not url or not sitekey:
+            raise HTTPException(status_code=400, detail={"status": "error", "error": "Parameter 'url' dan 'sitekey' wajib diisi"})
+
+        if self.page_pool.qsize() == 0:
+            return JSONResponse(content={"status": "error", "error": "Server penuh, coba lagi nanti"}, status_code=429)
+
+        task_id = str(uuid.uuid4())
+        self.results[task_id] = {"status": "process", "message": "solving turnstile", "start_time": time.time()}
+        try:
+            asyncio.create_task(self._solve_turnstile(task_id, url, sitekey, action, cdata))
+            return JSONResponse(content={"task_id": task_id, "status": "accepted"}, status_code=202)
+        except Exception as e:
             self.results.pop(task_id, None)
-            return JSONResponse(
-                content={"status": "error", "message": f"Kesalahan internal server: {str(e)}"},
-                status_code=500
-            )
+            return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+
+    async def process_clearance(
+        self,
+        url: str = Query(..., description="URL target yang dilindungi Cloudflare"),
+        timeout: int = Query(30, description="Waktu tunggu maksimal dalam detik (default: 30)"),
+    ):
+        """
+        Endpoint untuk mendapatkan cf_clearance cookie.
+
+        Response sukses berisi:
+        - cf_clearance : nilai cookie cf_clearance
+        - user_agent   : User-Agent yang HARUS dipakai bersama cookie ini
+        - cookies      : seluruh cookie domain dalam format header (opsional, untuk kemudahan)
+        """
+        if not url:
+            raise HTTPException(status_code=400, detail={"status": "error", "error": "Parameter 'url' wajib diisi"})
+
+        if self.page_pool.qsize() == 0:
+            return JSONResponse(content={"status": "error", "error": "Server penuh, coba lagi nanti"}, status_code=429)
+
+        task_id = str(uuid.uuid4())
+        self.results[task_id] = {"status": "process", "message": "solving clearance", "start_time": time.time()}
+        try:
+            asyncio.create_task(self._solve_clearance(task_id, url, timeout))
+            return JSONResponse(content={"task_id": task_id, "status": "accepted"}, status_code=202)
+        except Exception as e:
+            self.results.pop(task_id, None)
+            return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
 
     async def get_result(self, task_id: str = Query(..., alias="id")):
-        """Kembalikan hasil penyelesaian captcha"""
-        # Validasi parameter
         if not task_id:
-            return JSONResponse(
-                content={"status": "error", "message": "Parameter task_id tidak ada"},
-                status_code=400
-            )
-
-        # Periksa apakah tugas ada
+            return JSONResponse(content={"status": "error", "message": "Parameter id wajib diisi"}, status_code=400)
         if task_id not in self.results:
-            return JSONResponse(
-                content={"status": "error", "message": "task_id tidak valid atau tugas sudah kedaluwarsa"},
-                status_code=404
-            )
+            return JSONResponse(content={"status": "error", "message": "task_id tidak valid atau sudah expired"}, status_code=404)
 
         result = self.results[task_id]
 
-        # Periksa apakah tugas masih diproses
         if result.get("status") == "process":
-            # Periksa apakah tugas sudah timeout (lebih dari 5 menit)
             start_time = result.get("start_time", time.time())
-            if time.time() - start_time > 300:  # Timeout 5 menit
+            if time.time() - start_time > 300:
                 self.results[task_id] = {
                     "status": "error",
                     "elapsed_time": round(time.time() - start_time, 3),
@@ -332,25 +374,21 @@ class TurnstileAPIServer:
                 }
                 result = self.results[task_id]
             else:
-                # Tugas masih diproses, kembalikan status proses
                 return JSONResponse(content=result, status_code=202)
 
-        # Tugas selesai, kembalikan hasil dan bersihkan
         result = self.results.pop(task_id)
-
-        # Tentukan kode status HTTP berdasarkan status hasil
         if result.get("status") == "success":
             status_code = 200
         elif result.get("value") == "timeout":
-            status_code = 408  # Request Timeout
-        elif "captcha_fail" in result.get("value", ""):
-            status_code = 422  # Unprocessable Entity
+            status_code = 408
         else:
-            status_code = 500  # Internal Server Error
-
+            status_code = 422
         return JSONResponse(content=result, status_code=status_code)
-def create_app(headless: bool, thread: int, page_count: int, proxy_support: bool, proxy_file: str = "proxies.txt") -> FastAPI:
-    server = TurnstileAPIServer(headless=headless, thread=thread, page_count=page_count, proxy_support=proxy_support, proxy_file=proxy_file)
+
+
+def create_app(headless, thread, page_count, proxy_support, proxy_file="proxies.txt") -> FastAPI:
+    server = ClearanceAPIServer(headless=headless, thread=thread, page_count=page_count,
+                                proxy_support=proxy_support, proxy_file=proxy_file)
     return server.app
 
 
@@ -367,15 +405,16 @@ def _print_banner():
   ____        _                           |_|
  / ___|  ___ | |_   _____ _ __
  \___ \ / _ \| \ \ / / _ \ '__|
-  ___) | (_) | |\ V /  __/ |   Turnstile v1.0.0
+  ___) | (_) | |\ V /  __/ |   Clearance v1.0.0
  |____/ \___/|_| \_/ \___|_|
 """
-    print("\033[96m" + banner + "\033[0m")
+    print("\033[95m" + banner + "\033[0m")
     print("  \033[90m github.com/najibyahya/Turnstile-Solver\033[0m")
     print()
 
+
 # ──────────────────────────────────────────────
-#  AUTO INSTALL DEPENDENSI
+#  AUTO INSTALL
 # ──────────────────────────────────────────────
 def _auto_install():
     import subprocess
@@ -390,84 +429,59 @@ def _auto_install():
         except ImportError:
             print(f"  📦  Menginstall {pkg}...")
             installed = False
-            # Coba instalasi biasa dulu
-            for extra_args in [[], ["--break-system-packages"]]:
+            for extra in [[], ["--break-system-packages"]]:
                 try:
                     subprocess.check_call(
-                        [sys.executable, "-m", "pip", "install", pkg] + extra_args,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                        [sys.executable, "-m", "pip", "install", pkg] + extra,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                     )
                     installed = True
                     break
                 except subprocess.CalledProcessError:
                     continue
-            if installed:
-                print(f"  ✅  {pkg} berhasil diinstall")
-            else:
-                print(f"  ⚠️  Gagal install {pkg} via pip. Coba manual: pip install {pkg}")
+            print(f"  {'✅' if installed else '⚠️ Gagal install'}  {pkg}")
 
-    # Fetch browser camoufox jika belum ada
     import shutil
     if not shutil.which("camoufox") and not _camoufox_data_exists():
-        print("  🌐  Mengunduh data browser Camoufox (sekali saja)...")
+        print("  🌐  Mengunduh data browser Camoufox...")
         subprocess.check_call([sys.executable, "-m", "camoufox", "fetch"])
-        print("  ✅  Data browser Camoufox berhasil diunduh")
+        print("  ✅  Camoufox berhasil diunduh")
     print("═" * 52 + "\n")
-
-
-def _check_xvfb(headless: bool):
-    """Jika headless=False di Linux tanpa display, wajibkan xvfb-run."""
-    if sys.platform == "win32" or headless:
-        return  # Tidak diperlukan di Windows atau mode headless
-
-    import shutil, subprocess
-    display = os.environ.get("DISPLAY", "")
-    if display:
-        print("  ✅  DISPLAY terdeteksi, mode GUI dapat berjalan normal")
-        return
-
-    print("═" * 52)
-    print("  🖥️   CEK XVFB (diperlukan untuk headless=false di VPS)")
-    print("═" * 52)
-    print("  ⚠️   headless=false terdeteksi tapi tidak ada DISPLAY.")
-    print("  📌  Kamu berada di VPS/server tanpa GUI.")
-
-    # Coba install xvfb jika belum ada
-    if not shutil.which("xvfb-run"):
-        print("  📦  Menginstall Xvfb...")
-        try:
-            subprocess.check_call(
-                ["apt-get", "install", "-y", "xvfb"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            print("  ✅  Xvfb berhasil diinstall")
-        except Exception:
-            print("  ❌  Gagal install Xvfb otomatis. Jalankan manual:")
-            print("      sudo apt-get install -y xvfb")
-    else:
-        print("  ✅  Xvfb sudah terpasang")
-
-    print()
-    print("  🚨  WAJIB jalankan script dengan:")
-    print()
-    print("       xvfb-run -a python3 api_server.py")
-    print()
-    print("  ℹ️   Atau ubah headless=true di config.json untuk mode tanpa GUI.")
-    print("═" * 52 + "\n")
-    sys.exit(1)
 
 
 def _camoufox_data_exists():
-    """Cek apakah data browser camoufox sudah ada."""
-    import os
-    camoufox_dir = os.path.join(os.path.expanduser("~"), ".camoufox")
-    return os.path.isdir(camoufox_dir) and bool(os.listdir(camoufox_dir))
+    d = os.path.join(os.path.expanduser("~"), ".camoufox")
+    return os.path.isdir(d) and bool(os.listdir(d))
+
+
+def _check_xvfb(headless: bool):
+    if sys.platform == "win32" or headless:
+        return
+    import shutil, subprocess
+    if os.environ.get("DISPLAY", ""):
+        print("  ✅  DISPLAY terdeteksi, GUI dapat berjalan")
+        return
+    print("═" * 52)
+    print("  ⚠️   headless=false di VPS tanpa DISPLAY terdeteksi")
+    if not shutil.which("xvfb-run"):
+        print("  📦  Menginstall Xvfb...")
+        try:
+            subprocess.check_call(["apt-get", "install", "-y", "xvfb"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("  ✅  Xvfb berhasil diinstall")
+        except Exception:
+            print("  ❌  Gagal. Jalankan manual: sudo apt-get install -y xvfb")
+    print()
+    print("  🚨  Jalankan dengan:")
+    print("       xvfb-run -a python3 cf_clearance_server.py")
+    print()
+    print("  ℹ️   Atau ubah headless=true di config.json")
+    print("═" * 52)
+    sys.exit(1)
 
 
 # ──────────────────────────────────────────────
-#  LOAD & SIMPAN KONFIGURASI
+#  CONFIG
 # ──────────────────────────────────────────────
 CONFIG_PATH = "config.json"
 CONFIG_DEFAULTS = {
@@ -477,201 +491,157 @@ CONFIG_DEFAULTS = {
     "proxy_support": False,
     "proxy_file":    "proxies.txt",
     "host":          "0.0.0.0",
-    "port":          8000,
+    "port":          8001,   # port berbeda dari api_server.py agar bisa jalan bersamaan
     "debug":         False,
 }
 
+
 def _load_config() -> dict:
     try:
-        with open(CONFIG_PATH, "r") as f:
-            cfg = json.load(f)
-        return {**CONFIG_DEFAULTS, **cfg}
+        with open(CONFIG_PATH) as f:
+            return {**CONFIG_DEFAULTS, **json.load(f)}
     except FileNotFoundError:
         print(f"  ⚠️  {CONFIG_PATH} tidak ditemukan, menggunakan nilai default\n")
         return dict(CONFIG_DEFAULTS)
     except json.JSONDecodeError as e:
-        print(f"  ❌  Format {CONFIG_PATH} tidak valid: {e}, menggunakan nilai default\n")
+        print(f"  ❌  Format {CONFIG_PATH} tidak valid: {e}\n")
         return dict(CONFIG_DEFAULTS)
 
 
 def _save_config(cfg: dict):
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=4)
-    print(f"\n  💾  Konfigurasi disimpan ke {CONFIG_PATH}")
+    print(f"\n  💾  Config disimpan ke {CONFIG_PATH}")
 
 
-def _parse_value(key: str, raw: str, current):
-    """Konversi input string ke tipe yang sesuai dengan nilai saat ini."""
+def _parse_value(key, raw, current):
     raw = raw.strip()
-    if raw == "":
+    if not raw:
         return current
     if isinstance(current, bool):
-        return raw.lower() in ("true", "1", "yes", "y")
+        return raw.lower() in ("true", "1", "y", "yes")
     if isinstance(current, int):
         try:
             return int(raw)
         except ValueError:
-            print(f"  ⚠️  Nilai tidak valid untuk {key}, tetap menggunakan: {current}")
             return current
     return raw
 
 
-# ──────────────────────────────────────────────
-#  TAMPILKAN RINGKASAN & KONFIRMASI KONFIGURASI
-# ──────────────────────────────────────────────
 def _show_config_summary(cfg: dict):
     print("═" * 52)
     print("  ⚙️   KONFIGURASI AKTIF")
     print("═" * 52)
     labels = {
-        "headless":      ("Mode Headless (tanpa tampilan browser)", "bool"),
-        "thread":        ("Jumlah instance browser (thread)",       "int"),
-        "page_count":    ("Jumlah halaman per instance",            "int"),
-        "proxy_support": ("Dukungan proxy",                          "bool"),
-        "host":          ("Host server",                             "str"),
-        "port":          ("Port server",                             "int"),
-        "debug":         ("Mode Debug (tampilkan log detail)",       "bool"),
+        "headless":      ("Mode Headless",                    "bool"),
+        "thread":        ("Jumlah instance browser",          "int"),
+        "page_count":    ("Halaman per instance",             "int"),
+        "proxy_support": ("Dukungan proxy",                   "bool"),
+        "host":          ("Host server",                      "str"),
+        "port":          ("Port server",                      "int"),
+        "debug":         ("Mode Debug",                       "bool"),
     }
     for i, (key, (label, _)) in enumerate(labels.items(), 1):
-        val = cfg[key]
-        print(f"  [{i}] {label:<40} : {val}")
+        print(f"  [{i}] {label:<38} : {cfg.get(key)}")
     print("═" * 52)
 
 
 def _interactive_config(cfg: dict) -> dict:
-    """Tampilkan ringkasan dan beri opsi edit sebelum server dijalankan."""
     _show_config_summary(cfg)
     print()
-    answer = input("  ▶  Lanjutkan dengan konfigurasi ini? [Enter/Y = ya  |  N = ubah] : ").strip().lower()
-
-    if answer not in ("n", "no", "tidak"):
-        return cfg  # Tidak ada perubahan
-
-    # Mode edit – tampilkan tiap field, Enter untuk lewati
-    print()
-    print("  ✏️   Masukkan nilai baru (tekan Enter untuk mempertahankan nilai saat ini)")
-    print("─" * 52)
+    ans = input("  ▶  Lanjutkan? [Enter/Y = ya  |  N = ubah] : ").strip().lower()
+    if ans not in ("n", "no", "tidak"):
+        return cfg
 
     field_order = ["headless", "thread", "page_count", "proxy_support", "host", "port", "debug"]
     labels = {
         "headless":      "Mode Headless (true/false)",
-        "thread":        "Jumlah thread / instance browser",
-        "page_count":    "Jumlah halaman per instance",
+        "thread":        "Jumlah thread",
+        "page_count":    "Halaman per instance",
         "proxy_support": "Dukungan proxy (true/false)",
         "host":          "Host server",
         "port":          "Port server",
-        "debug":         "Mode Debug — tampilkan log DEBUG (true/false)",
+        "debug":         "Mode Debug (true/false)",
     }
-
+    print("\n  ✏️   Tekan Enter untuk mempertahankan nilai saat ini")
+    print("─" * 52)
     new_cfg = dict(cfg)
     for key in field_order:
-        current = cfg[key]
-        raw = input(f"  {labels[key]} [{current}] : ")
-        new_cfg[key] = _parse_value(key, raw, current)
+        raw = input(f"  {labels[key]} [{cfg[key]}] : ")
+        new_cfg[key] = _parse_value(key, raw, cfg[key])
 
-    # Tampilkan ulang hasil perubahan
     print()
-    print("  📋  Konfigurasi yang akan digunakan:")
     _show_config_summary(new_cfg)
-
-    save = input("\n  💾  Simpan konfigurasi ini ke config.json? [Y/Enter = ya  |  N = tidak] : ").strip().lower()
-    if save not in ("n", "no", "tidak"):
+    if input("\n  💾  Simpan? [Y/Enter = ya  |  N = tidak] : ").strip().lower() not in ("n", "no"):
         _save_config(new_cfg)
-
     return new_cfg
 
 
-# ──────────────────────────────────────────────
-#  CEK SISTEM (CPU & RAM)
-# ──────────────────────────────────────────────
-def _check_system(cfg: dict):
-    """Tampilkan info CPU & RAM saat ini beserta rekomendasi kesesuaian config."""
-    import psutil, os
-
-    cpu_count  = os.cpu_count() or 1
-    cpu_usage  = psutil.cpu_percent(interval=1)
-    ram        = psutil.virtual_memory()
-    ram_total  = ram.total / (1024 ** 3)          # GB
-    ram_used   = ram.used  / (1024 ** 3)          # GB
-    ram_free   = ram.available / (1024 ** 3)      # GB
-    ram_pct    = ram.percent
-
-    thread     = cfg.get("thread", 2)
-    page_count = cfg.get("page_count", 1)
-    total_pages = thread * page_count
-
-    # Perkiraan RAM yang dibutuhkan (~300 MB per halaman browser)
-    est_ram_gb = total_pages * 0.3
-
-    print("═" * 52)
-    print("  💻  INFO SISTEM")
-    print("═" * 52)
-    print(f"  🖥️  CPU     : {cpu_count} core  |  terpakai {cpu_usage:.1f}%")
-    print(f"  🧠  RAM     : {ram_total:.1f} GB total  |  terpakai {ram_used:.1f} GB ({ram_pct:.1f}%)  |  bebas {ram_free:.1f} GB")
-    print(f"  📋  Config  : {thread} thread × {page_count} halaman = {total_pages} slot konkuren")
-    print(f"  📊  Est. kebutuhan RAM browser : ±{est_ram_gb:.1f} GB")
-    print("─" * 52)
-
-    # --- Rekomendasi ---
-    issues = []
-    if thread > cpu_count:
-        issues.append(f"  ⚠️  thread ({thread}) melebihi jumlah core CPU ({cpu_count}) → potensi lambat")
-    if est_ram_gb > ram_free * 0.85:
-        issues.append(f"  ⚠️  Estimasi RAM browser ({est_ram_gb:.1f} GB) mendekati/melebihi RAM bebas ({ram_free:.1f} GB)")
-    if cpu_usage > 80:
-        issues.append(f"  ⚠️  CPU sedang tinggi ({cpu_usage:.1f}%) → pertimbangkan kurangi thread")
-
-    if issues:
-        print("  ❌  PERINGATAN KESESUAIAN CONFIG:")
-        for iss in issues:
-            print(iss)
-    else:
-        print("  ✅  Konfigurasi tampak sesuai dengan sumber daya sistem saat ini")
-    print("═" * 52 + "\n")
-
-
-# ──────────────────────────────────────────────
-#  CEK PORT
-# ──────────────────────────────────────────────
 def _check_port(cfg: dict) -> dict:
-    """Cek apakah port di config sudah dipakai. Jika ya, minta user ganti."""
     import socket
-
     while True:
-        port = cfg.get("port", 8000)
+        port = cfg.get("port", 8001)
         host = cfg.get("host", "0.0.0.0")
-        bind_host = "127.0.0.1" if host == "0.0.0.0" else host
-
+        bind = "127.0.0.1" if host == "0.0.0.0" else host
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(1)
-            in_use = s.connect_ex((bind_host, port)) == 0
-
+            in_use = s.connect_ex((bind, port)) == 0
         if not in_use:
             print(f"  ✅  Port {port} tersedia")
             print("═" * 52 + "\n")
             break
-
-        print(f"  ❌  Port {port} sudah digunakan oleh proses lain!")
+        print(f"  ❌  Port {port} sudah digunakan!")
         try:
-            raw = input(f"  🔁  Masukkan port pengganti [contoh: 8080] : ").strip()
-            new_port = int(raw)
+            new_port = int(input(f"  🔁  Port pengganti : ").strip())
             cfg = dict(cfg)
             cfg["port"] = new_port
-
-            save = input(f"  💾  Simpan port {new_port} ke config.json? [Y/Enter = ya  |  N = tidak] : ").strip().lower()
-            if save not in ("n", "no", "tidak"):
+            if input(f"  💾  Simpan port {new_port}? [Y/Enter] : ").strip().lower() not in ("n", "no"):
                 _save_config(cfg)
         except ValueError:
-            print("  ⚠️  Input tidak valid, coba lagi")
-            continue
-
+            print("  ⚠️  Input tidak valid")
     return cfg
+
+
+def _check_system(cfg: dict):
+    import psutil
+    cpu_count = os.cpu_count() or 1
+    cpu_usage = psutil.cpu_percent(interval=1)
+    ram = psutil.virtual_memory()
+    ram_total = ram.total / 1024**3
+    ram_free = ram.available / 1024**3
+    ram_pct = ram.percent
+    thread = cfg.get("thread", 2)
+    page_count = cfg.get("page_count", 1)
+    total = thread * page_count
+    est_ram = total * 0.3
+    print("═" * 52)
+    print("  💻  INFO SISTEM")
+    print("═" * 52)
+    print(f"  🖥️  CPU  : {cpu_count} core | terpakai {cpu_usage:.1f}%")
+    print(f"  🧠  RAM  : {ram_total:.1f} GB | bebas {ram_free:.1f} GB ({ram_pct:.1f}%)")
+    print(f"  📋  Config: {thread} thread × {page_count} halaman = {total} slot")
+    print(f"  📊  Est. RAM browser: ±{est_ram:.1f} GB")
+    print("─" * 52)
+    issues = []
+    if thread > cpu_count:
+        issues.append(f"  ⚠️  thread ({thread}) > core CPU ({cpu_count})")
+    if est_ram > ram_free * 0.85:
+        issues.append(f"  ⚠️  Est. RAM ({est_ram:.1f} GB) mendekati RAM bebas ({ram_free:.1f} GB)")
+    if cpu_usage > 80:
+        issues.append(f"  ⚠️  CPU tinggi ({cpu_usage:.1f}%)")
+    if issues:
+        print("  ❌  Peringatan:")
+        for i in issues:
+            print(i)
+    else:
+        print("  ✅  Config sesuai dengan resource sistem")
+    print("═" * 52 + "\n")
 
 
 # ──────────────────────────────────────────────
 #  ENTRY POINT
 # ──────────────────────────────────────────────
-if __name__ == '__main__':
+if __name__ == "__main__":
     _print_banner()
     _auto_install()
     config = _load_config()
@@ -682,17 +652,16 @@ if __name__ == '__main__':
     print("═" * 52)
     print("  🔍  CEK PORT & SUMBER DAYA SISTEM")
     print("═" * 52)
-    # Konfigurasi level logging
     log_level = "DEBUG" if config.get("debug", False) else "INFO"
     logger.remove()
     logger.add(sys.stderr, level=log_level)
-    logger.info(f"Level log diset ke: {log_level}")
+    logger.info(f"Level log: {log_level}")
 
     _check_system(config)
     config = _check_port(config)
 
     print("═" * 52)
-    print("  🚀  Memulai server Turnstile Solver...")
+    print("  🚀  Memulai Boterdrop Clearance Solver...")
     print("═" * 52 + "\n")
 
     app = create_app(
