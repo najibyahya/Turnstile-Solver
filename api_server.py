@@ -55,6 +55,7 @@ class ClearanceAPIServer:
         self.camoufox = None
         self.browser = None
         self.results = {}
+        self.contexts = []  # Track semua context agar bisa di-restart dengan aman
         self.proxies = []
         self._proxy_index = 0
         self.max_task_num = self.thread_count * self.page_count
@@ -130,15 +131,22 @@ class ClearanceAPIServer:
             args=self.browser_args
         )
         self.browser = await self.camoufox.start()
-        for _ in range(self.thread_count):
-            proxy = self._next_proxy() if self.proxy_support else None
-            context = await self._create_context_with_proxy(proxy)
-            for _ in range(self.page_count):
-                page = await context.new_page()
-                await self.page_pool.put((page, context))
+        await self._build_page_pool()
         logger.success(f"Pool siap: {self.page_pool.qsize()} halaman")
         asyncio.create_task(self._cleanup_results())
         asyncio.create_task(self._periodic_cleanup())
+
+    async def _build_page_pool(self):
+        """Buat/rebuild semua context dan page ke dalam pool."""
+        self.contexts = []
+        self._proxy_index = 0
+        for _ in range(self.thread_count):
+            proxy = self._next_proxy() if self.proxy_support else None
+            context = await self._create_context_with_proxy(proxy)
+            self.contexts.append(context)
+            for _ in range(self.page_count):
+                page = await context.new_page()
+                await self.page_pool.put((page, context))
 
     async def _cleanup_results(self):
         """Bersihkan semua hasil (success & error) yang sudah lebih dari 10 menit dan belum diambil."""
@@ -156,15 +164,29 @@ class ClearanceAPIServer:
                 logger.info(f"[Cleanup] Menghapus {len(expired)} hasil kedaluwarsa dari memori")
 
     async def _periodic_cleanup(self, interval_minutes: int = 10):
-        """Bersihkan cookie & reset halaman secara berkala tanpa menutup context (aman dari race condition)."""
+        """
+        Periodic cleanup yang benar-benar membebaskan RAM:
+        - Jika semua page idle → full context restart (close & recreate)
+        - Jika ada page yang sedang dipakai → light cleanup saja, coba lagi siklus berikutnya
+        """
         while True:
             await asyncio.sleep(interval_minutes * 60)
-            logger.info("[Cleanup] Memulai pembersihan cookie & reset halaman...")
-            total = self.max_task_num
-            success = 0
-            for _ in range(total):
-                try:
-                    page, context = await self.page_pool.get()
+            logger.info("[Cleanup] Mencoba drain pool untuk restart context...")
+
+            # Drain semua page dari pool secara non-blocking
+            collected = []
+            try:
+                while True:
+                    item = self.page_pool.get_nowait()
+                    collected.append(item)
+            except asyncio.QueueEmpty:
+                pass
+
+            if len(collected) < self.max_task_num:
+                # Ada task yang sedang berjalan → hanya light cleanup pada page yang idle
+                busy = self.max_task_num - len(collected)
+                logger.info(f"[Cleanup] {busy} page sedang dipakai, light cleanup pada {len(collected)} page idle...")
+                for page, context in collected:
                     try:
                         await page.unroute_all()
                     except Exception:
@@ -178,15 +200,88 @@ class ClearanceAPIServer:
                     except Exception:
                         pass
                     await self.page_pool.put((page, context))
-                    success += 1
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    logger.warning(f"[Cleanup] Gagal reset halaman: {e}")
-            logger.success(f"[Cleanup] Selesai, {success}/{total} halaman berhasil dibersihkan")
+                logger.info("[Cleanup] Light cleanup selesai, full restart ditunda ke siklus berikutnya")
+                continue
+
+            # Semua page idle → Full context restart untuk bebaskan RAM
+            logger.info("[Cleanup] Semua page idle, memulai full context restart...")
+
+            # Tutup semua page
+            for page, _ in collected:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+            # Tutup semua context (ini yang bebaskan RAM Firefox)
+            for context in self.contexts:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
+            # Recreate semua context dan page
+            await self._build_page_pool()
+            logger.success(f"[Cleanup] Full context restart selesai, {self.page_pool.qsize()} halaman siap")
 
     # ──────────────────────────────────────────────
     #  TURNSTILE SOLVER
     # ──────────────────────────────────────────────
+
+    async def _save_debug_on_fail(self, page, task_id: str, round_num: int, url: str):
+        """Simpan screenshot + HTML + info halaman ke debug_logs/ saat gagal."""
+        try:
+            debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_logs")
+            os.makedirs(debug_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            prefix = os.path.join(debug_dir, f"{ts}_{task_id[:8]}_r{round_num}")
+
+            # Screenshot
+            try:
+                await page.screenshot(path=f"{prefix}.png", full_page=True)
+            except Exception as e:
+                logger.debug(f"[Debug] Gagal screenshot: {e}")
+
+            # Info halaman
+            info = {}
+            try:
+                info["title"] = await page.title()
+            except Exception:
+                info["title"] = "N/A"
+            try:
+                info["url"] = page.url
+            except Exception:
+                info["url"] = "N/A"
+            try:
+                info["turnstile_widget_exists"] = await page.locator("//div[@class='cf-turnstile']").count() > 0
+            except Exception:
+                info["turnstile_widget_exists"] = "N/A"
+            try:
+                info["cf_response_value"] = await page.input_value("[name=cf-turnstile-response]", timeout=500)
+            except Exception:
+                info["cf_response_value"] = "not found"
+            try:
+                info["js_errors"] = await page.evaluate(
+                    "() => window.__debugErrors || []"
+                )
+            except Exception:
+                info["js_errors"] = []
+            try:
+                info["html_snippet"] = await page.inner_html("body")
+            except Exception:
+                info["html_snippet"] = "N/A"
+
+            info["task_id"] = task_id
+            info["target_url"] = url
+            info["round"] = round_num
+            info["timestamp"] = ts
+
+            with open(f"{prefix}.json", "w", encoding="utf-8") as f:
+                json.dump(info, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"[Debug] Disimpan: {prefix}.png + .json")
+        except Exception as e:
+            logger.warning(f"[Debug] Gagal simpan debug: {e}")
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str,
                                 action: str = None, cdata: str = None):
@@ -201,27 +296,67 @@ class ClearanceAPIServer:
                 + "></div>"
             )
             page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
-            await page.route(url_with_slash, lambda route: route.fulfill(body=page_data, status=200))
-            await page.goto(url_with_slash)
-            await page.eval_on_selector("//div[@class='cf-turnstile']", "el => el.style.width = '70px'")
 
-            for attempt in range(30):
+            MAX_ROUNDS = 2
+            for round_num in range(1, MAX_ROUNDS + 1):
+                if round_num > 1:
+                    logger.info(f"[Turnstile] Putaran {round_num}: reload halaman — {task_id}")
+                    if self.proxy_support and self.proxies:
+                        proxy = self._next_proxy()
+                        try:
+                            new_context = await self._create_context_with_proxy(proxy)
+                            new_page = await new_context.new_page()
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
+                            try:
+                                await context.close()
+                            except Exception:
+                                pass
+                            page, context = new_page, new_context
+                            logger.info(f"[Turnstile] Proxy diganti: {proxy} — {task_id}")
+                        except Exception as e:
+                            logger.warning(f"[Turnstile] Gagal ganti proxy: {e}, tetap pakai context lama")
+
+                # Pasang error listener JS untuk debug
                 try:
-                    value = await page.input_value("[name=cf-turnstile-response]", timeout=400)
-                    if value == "":
-                        await page.locator("//div[@class='cf-turnstile']").click(timeout=400)
-                        await asyncio.sleep(0.2)
-                    else:
-                        elapsed = round(time.time() - start_time, 3)
-                        self.results[task_id] = {"status": "success", "elapsed_time": elapsed, "value": value}
-                        logger.info(f"[Turnstile] Sukses — {task_id} ({elapsed}s)")
-                        return
-                except Exception as e:
-                    logger.debug(f"[Turnstile] Percobaan {attempt + 1} gagal: {e}")
+                    await page.evaluate("() => { window.__debugErrors = []; window.onerror = (m,s,l,c,e) => { window.__debugErrors.push({msg:m,src:s,line:l,col:c}); }; }")
+                except Exception:
+                    pass
+
+                try:
+                    await page.unroute_all()
+                except Exception:
+                    pass
+                await page.route(url_with_slash, lambda route: route.fulfill(body=page_data, status=200))
+                await page.goto(url_with_slash)
+                await page.eval_on_selector("//div[@class='cf-turnstile']", "el => el.style.width = '70px'")
+
+                solved = False
+                for attempt in range(80):  # 80 × 0.3s = ~24 detik timeout
+                    try:
+                        value = await page.input_value("[name=cf-turnstile-response]", timeout=400)
+                        if value == "":
+                            await page.locator("//div[@class='cf-turnstile']").click(timeout=400)
+                            await asyncio.sleep(0.3)
+                        else:
+                            elapsed = round(time.time() - start_time, 3)
+                            self.results[task_id] = {"status": "success", "elapsed_time": elapsed, "value": value}
+                            logger.info(f"[Turnstile] Sukses (putaran {round_num}) — {task_id} ({elapsed}s)")
+                            solved = True
+                            return
+                    except Exception as e:
+                        logger.debug(f"[Turnstile] Putaran {round_num} percobaan {attempt + 1} gagal: {e}")
+
+                if not solved:
+                    logger.warning(f"[Turnstile] Putaran {round_num} gagal 30x — {task_id}, {'retry...' if round_num < MAX_ROUNDS else 'menyerah'}")
+                    # Simpan debug info di setiap putaran yang gagal
+                    await self._save_debug_on_fail(page, task_id, round_num, url_with_slash)
 
             elapsed = round(time.time() - start_time, 3)
             self.results[task_id] = {"status": "error", "elapsed_time": elapsed, "value": "captcha_fail"}
-            logger.warning(f"[Turnstile] Gagal setelah 30 percobaan — {task_id}")
+            logger.warning(f"[Turnstile] Gagal setelah {MAX_ROUNDS} putaran — {task_id}")
         except Exception as e:
             elapsed = round(time.time() - start_time, 3)
             self.results[task_id] = {"status": "error", "elapsed_time": elapsed, "value": "captcha_fail"}
@@ -232,6 +367,7 @@ class ClearanceAPIServer:
             except Exception:
                 pass
             await self.page_pool.put((page, context))
+
 
     # ──────────────────────────────────────────────
     #  CF_CLEARANCE SOLVER
