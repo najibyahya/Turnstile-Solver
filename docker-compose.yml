@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  solver:
+    build: .
+    container_name: solver
+    ports:
+      - "8000:8000"
+    environment:
+      - THREADS=2
+      - PAGE_COUNT=2
+    volumes:
+      - ./config.json:/app/config.json
+    restart: unless-stopped
+    shm_size: '2gb'
+    deploy:
+      resources:
+        limits:
+          memory: 4G
